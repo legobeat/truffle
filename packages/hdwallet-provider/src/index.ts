@@ -7,15 +7,24 @@ import * as EthUtil from "ethereumjs-util";
 import { Transaction, FeeMarketEIP1559Transaction } from "@ethereumjs/tx";
 import Common from "@ethereumjs/common";
 
-import ProviderEngine from "web3-provider-engine";
-// @ts-ignore - web3-provider-engine doesn't have declaration files for these subproviders
-import FiltersSubprovider from "web3-provider-engine/subproviders/filters";
+import { PollingBlockTracker } from "eth-block-tracker";
+import { JsonRpcEngine } from "@metamask/json-rpc-engine";
+import { providerAsMiddleware } from "@metamask/eth-json-rpc-middleware";
+//import type { JsonRpcMiddleware } from "@metamask/json-rpc-engine";
+import {
+  SafeEventEmitterProvider,
+  providerFromEngine
+} from "@metamask/eth-json-rpc-provider";
+
+// @ts-ignore
+import createFilterMiddleware from "eth-json-rpc-filters";
 // @ts-ignore
 import NonceSubProvider from "web3-provider-engine/subproviders/nonce-tracker";
+// import NonceSubProvider from "nonce-tracker";
 // @ts-ignore
 import HookedSubprovider from "web3-provider-engine/subproviders/hooked-wallet";
 // @ts-ignore
-import ProviderSubprovider from "web3-provider-engine/subproviders/provider";
+//import ProviderSubprovider from "web3-provider-engine/subproviders/provider";
 // @ts-ignore
 import RpcProvider from "web3-provider-engine/subproviders/rpc";
 // @ts-ignore
@@ -23,14 +32,20 @@ import WebsocketProvider from "web3-provider-engine/subproviders/websocket";
 
 import Url from "url";
 import type {
-  JSONRPCRequestPayload,
-  JSONRPCResponsePayload
-} from "ethereum-protocol";
+  JsonRpcParams,
+  JsonRpcRequest,
+  JsonRpcResponse
+} from "@metamask/utils";
 import type { ConstructorArguments } from "./constructor/ConstructorArguments";
 import { getOptions } from "./constructor/getOptions";
 import { getPrivateKeys } from "./constructor/getPrivateKeys";
 import { getMnemonic } from "./constructor/getMnemonic";
-import type { ChainId, ChainSettings, Hardfork } from "./constructor/types";
+import type {
+  ChainId,
+  ChainSettings,
+  Hardfork,
+  ProviderOrUrl
+} from "./constructor/types";
 import { signTypedData, SignTypedDataVersion } from "@metamask/eth-sig-util";
 import {
   createAccountGeneratorFromSeedAndPath,
@@ -44,18 +59,41 @@ import {
 // function, resetting nonce from tx to tx. An instance can opt out
 // of this behavior by passing `shareNonce=false` to the constructor.
 // See issue #65 for more
-const singletonNonceSubProvider = new NonceSubProvider();
+let singletonNonceSubProvider: null | NonceSubProvider;
+
+// TODO: Constrain type
+type JsonRpcProvider = Record<string, unknown>;
+
+const getSingletonNonceSubProvider = (_opts: {
+  rpcProvider: JsonRpcProvider;
+  blockTracker: any;
+}): NonceSubProvider => {
+  if (singletonNonceSubProvider) {
+    // TODO: throw if opts mismatch existing?
+  } else {
+    singletonNonceSubProvider = new NonceSubProvider({
+      // provider: opts.rpcProvider,
+      /*
+      provider: opts.rpcProvider.provider as any,
+      blockTracker: opts.blockTracker,
+      getPendingTransactions: (_address: string) => [],
+      getConfirmedTransactions: (_address: string) => []
+      */
+    });
+  }
+  return singletonNonceSubProvider;
+};
 
 class HDWalletProvider {
   private walletHdpath: string;
   #wallets: { [address: string]: Buffer };
   #addresses: string[];
+  #provider: SafeEventEmitterProvider;
   private chainId?: ChainId;
   private chainSettings: ChainSettings;
   private hardfork: Hardfork;
   private initialized: Promise<void>;
-
-  public engine: ProviderEngine;
+  public _blockTracker: PollingBlockTracker;
 
   constructor(...args: ConstructorArguments) {
     const {
@@ -81,16 +119,32 @@ class HDWalletProvider {
     this.#wallets = {};
     this.#addresses = [];
     this.chainSettings = chainSettings;
-    this.engine = new ProviderEngine({
-      pollingInterval
+    const engine = new JsonRpcEngine({
+      // pollingInterval
     });
 
-    let providerToUse;
-    if (HDWalletProvider.isValidProvider(provider)) {
+    let providerToUse: ProviderOrUrl;
+    if (
+      typeof provider !== "undefined" &&
+      HDWalletProvider.isValidProvider(provider)
+    ) {
       providerToUse = provider;
-    } else if (HDWalletProvider.isValidProvider(url)) {
+    } else if (
+      typeof url !== "undefined" &&
+      HDWalletProvider.isValidProvider(url)
+    ) {
       providerToUse = url;
     } else {
+      if (typeof providerOrUrl === "undefined") {
+        throw new Error(
+          [
+            `No provider or an invalid provider was specified.`,
+            "Please specify a valid provider or URL, using the http, https, " +
+              "ws, or wss protocol.",
+            ""
+          ].join("\n")
+        );
+      }
       providerToUse = providerOrUrl;
     }
 
@@ -99,7 +153,7 @@ class HDWalletProvider {
         [
           `No provider or an invalid provider was specified: '${providerToUse}'`,
           "Please specify a valid provider or URL, using the http, https, " +
-          "ws, or wss protocol.",
+            "ws, or wss protocol.",
           ""
         ].join("\n")
       );
@@ -119,12 +173,188 @@ class HDWalletProvider {
     if (this.#addresses.length === 0) {
       throw new Error(
         `Could not create addresses from your mnemonic or private key(s). ` +
-        `Please check that your inputs are correct.`
+          `Please check that your inputs are correct.`
       );
     }
 
     const tmpAccounts = this.#addresses;
     const tmpWallets = this.#wallets;
+
+    // EIP155 compliant transactions are enabled for hardforks later
+    // than or equal to "spurious dragon"
+    this.hardfork =
+      chainSettings && chainSettings.hardfork
+        ? chainSettings.hardfork
+        : "london";
+
+    const self = this;
+
+    const hookedSubprovider = new HookedSubprovider({
+      getAccounts(cb: any) {
+        cb(null, tmpAccounts);
+      },
+      getPrivateKey(address: string, cb: any) {
+        if (!tmpWallets[address]) {
+          cb("Account not found");
+          return;
+        } else {
+          cb(null, tmpWallets[address].toString("hex"));
+        }
+      },
+      async signTransaction(txParams: any, cb: any) {
+        await self.initialized;
+        // we need to rename the 'gas' field
+        txParams.gasLimit = txParams.gas;
+        delete txParams.gas;
+
+        let pkey;
+        const from = txParams.from.toLowerCase();
+        if (tmpWallets[from]) {
+          pkey = tmpWallets[from];
+        } else {
+          cb("Account not found");
+          return;
+        }
+        const chain = self.chainId;
+        const KNOWN_CHAIN_IDS = new Set([1, 3, 4, 5, 42]);
+        let txOptions;
+        if (typeof chain !== "undefined" && KNOWN_CHAIN_IDS.has(chain)) {
+          txOptions = {
+            common: new Common({ chain, hardfork: self.hardfork })
+          };
+        } else if (typeof chain !== "undefined") {
+          txOptions = {
+            common: Common.forCustomChain(
+              1,
+              {
+                name: "custom chain",
+                chainId: chain
+              },
+              self.hardfork
+            )
+          };
+        }
+
+        // Taken from https://github.com/ethers-io/ethers.js/blob/2a7ce0e72a1e0c9469e10392b0329e75e341cf18/packages/abstract-signer/src.ts/index.ts#L215
+        const hasEip1559 =
+          txParams.maxFeePerGas !== undefined ||
+          txParams.maxPriorityFeePerGas !== undefined;
+        const tx = hasEip1559
+          ? FeeMarketEIP1559Transaction.fromTxData(txParams, txOptions)
+          : Transaction.fromTxData(txParams, txOptions);
+
+        const signedTx = tx.sign(pkey as Buffer);
+        const rawTx = `0x${signedTx.serialize().toString("hex")}`;
+        cb(null, rawTx);
+      },
+      signMessage({ data, from }: any, cb: any) {
+        const dataIfExists = data;
+        if (!dataIfExists) {
+          cb("No data to sign");
+          return;
+        }
+        if (!tmpWallets[from]) {
+          cb("Account not found");
+          return;
+        }
+        let pkey = tmpWallets[from];
+        const dataBuff = EthUtil.toBuffer(dataIfExists);
+        const msgHashBuff = EthUtil.hashPersonalMessage(dataBuff);
+        const sig = EthUtil.ecsign(msgHashBuff, pkey);
+        const rpcSig = EthUtil.toRpcSig(sig.v, sig.r, sig.s);
+        cb(null, rpcSig);
+      },
+      signPersonalMessage(...args: any[]) {
+        this.signMessage(...args);
+      },
+      signTypedMessage(
+        { data, from }: { data: string; from: string },
+        cb: any
+      ) {
+        if (!data) {
+          cb("No data to sign");
+          return;
+        }
+        // convert address to lowercase in case it is in checksum format
+        const fromAddress = from.toLowerCase();
+        if (!tmpWallets[fromAddress]) {
+          cb("Account not found");
+          return;
+        }
+        const signature = signTypedData({
+          data: JSON.parse(data),
+          privateKey: tmpWallets[fromAddress],
+          version: SignTypedDataVersion.V4
+        });
+        cb(null, signature);
+      }
+    });
+
+    const createProvider = () => {
+      if (typeof providerToUse === "string") {
+        const url = providerToUse;
+
+        const providerProtocol = (
+          Url.parse(url).protocol || "http:"
+        ).toLowerCase();
+
+        switch (providerProtocol) {
+          case "ws:":
+          case "wss:":
+            return new WebsocketProvider({ rpcUrl: url });
+          default:
+            return new RpcProvider({ rpcUrl: url });
+        }
+      } else {
+        return providerToUse;
+      }
+    };
+    const rpcProvider = createProvider();
+    const rpcProviderMiddleware = providerAsMiddleware(rpcProvider);
+    console.log("HDP.CONSTRUCTOR", { rpcProvider });
+
+    const blockTracker = new PollingBlockTracker({
+      provider: rpcProvider,
+      pollingInterval
+      // retryTimeout?: number;
+      // keepEventLoopActive?: boolean;
+      // setSkipCacheFlag?: boolean;
+      // blockResetDuration?: number;
+      // usePastBlocks?: boolean;
+    });
+    this._blockTracker = blockTracker;
+
+    const nonceSubProvider = shareNonce
+      ? getSingletonNonceSubProvider({
+          blockTracker,
+          rpcProvider
+        })
+      : new NonceSubProvider({
+          /*
+          blockTracker,
+          provider: rpcProvider,
+          getPendingTransactions: (_address: string) => [],
+          getConfirmedTransactions: (_address: string) => []
+      */
+        });
+
+    const filtersSubProvider = createFilterMiddleware({
+      blockTracker,
+      provider: rpcProvider
+    });
+    engine.push((req, _res, next, end) => {
+      console.log("EN1", { req, _res, next, end });
+      return hookedSubprovider.handleRequest(req, next, end);
+    });
+    engine.push((req, _res, next, end) => {
+      console.log("EN2", { req, _res, next, end });
+      return nonceSubProvider.handleRequest(req, next, end);
+    });
+    engine.push(filtersSubProvider);
+    // engine.push(filtersSubProvider.handleRequest);
+    engine.push(rpcProviderMiddleware);
+
+    this.#provider = providerFromEngine(engine);
 
     // if user supplied the chain id, use that - otherwise fetch it
     if (
@@ -136,167 +366,28 @@ class HDWalletProvider {
     } else {
       this.initialized = this.initialize();
     }
-
-    // EIP155 compliant transactions are enabled for hardforks later
-    // than or equal to "spurious dragon"
-    this.hardfork =
-      chainSettings && chainSettings.hardfork
-        ? chainSettings.hardfork
-        : "london";
-
-    const self = this;
-
-    this.engine.addProvider(
-      new HookedSubprovider({
-        getAccounts(cb: any) {
-          cb(null, tmpAccounts);
-        },
-        getPrivateKey(address: string, cb: any) {
-          if (!tmpWallets[address]) {
-            cb("Account not found");
-            return;
-          } else {
-            cb(null, tmpWallets[address].toString("hex"));
-          }
-        },
-        async signTransaction(txParams: any, cb: any) {
-          await self.initialized;
-          // we need to rename the 'gas' field
-          txParams.gasLimit = txParams.gas;
-          delete txParams.gas;
-
-          let pkey;
-          const from = txParams.from.toLowerCase();
-          if (tmpWallets[from]) {
-            pkey = tmpWallets[from];
-          } else {
-            cb("Account not found");
-            return;
-          }
-          const chain = self.chainId;
-          const KNOWN_CHAIN_IDS = new Set([1, 3, 4, 5, 42]);
-          let txOptions;
-          if (typeof chain !== "undefined" && KNOWN_CHAIN_IDS.has(chain)) {
-            txOptions = {
-              common: new Common({ chain, hardfork: self.hardfork })
-            };
-          } else if (typeof chain !== "undefined") {
-            txOptions = {
-              common: Common.forCustomChain(
-                1,
-                {
-                  name: "custom chain",
-                  chainId: chain
-                },
-                self.hardfork
-              )
-            };
-          }
-
-          // Taken from https://github.com/ethers-io/ethers.js/blob/2a7ce0e72a1e0c9469e10392b0329e75e341cf18/packages/abstract-signer/src.ts/index.ts#L215
-          const hasEip1559 =
-            txParams.maxFeePerGas !== undefined ||
-            txParams.maxPriorityFeePerGas !== undefined;
-          const tx = hasEip1559
-            ? FeeMarketEIP1559Transaction.fromTxData(txParams, txOptions)
-            : Transaction.fromTxData(txParams, txOptions);
-
-          const signedTx = tx.sign(pkey as Buffer);
-          const rawTx = `0x${signedTx.serialize().toString("hex")}`;
-          cb(null, rawTx);
-        },
-        signMessage({ data, from }: any, cb: any) {
-          const dataIfExists = data;
-          if (!dataIfExists) {
-            cb("No data to sign");
-            return;
-          }
-          if (!tmpWallets[from]) {
-            cb("Account not found");
-            return;
-          }
-          let pkey = tmpWallets[from];
-          const dataBuff = EthUtil.toBuffer(dataIfExists);
-          const msgHashBuff = EthUtil.hashPersonalMessage(dataBuff);
-          const sig = EthUtil.ecsign(msgHashBuff, pkey);
-          const rpcSig = EthUtil.toRpcSig(sig.v, sig.r, sig.s);
-          cb(null, rpcSig);
-        },
-        signPersonalMessage(...args: any[]) {
-          this.signMessage(...args);
-        },
-        signTypedMessage(
-          { data, from }: { data: string; from: string },
-          cb: any
-        ) {
-          if (!data) {
-            cb("No data to sign");
-            return;
-          }
-          // convert address to lowercase in case it is in checksum format
-          const fromAddress = from.toLowerCase();
-          if (!tmpWallets[fromAddress]) {
-            cb("Account not found");
-            return;
-          }
-          const signature = signTypedData({
-            data: JSON.parse(data),
-            privateKey: tmpWallets[fromAddress],
-            version: SignTypedDataVersion.V4
-          });
-          cb(null, signature);
-        }
-      })
-    );
-
-    !shareNonce
-      ? this.engine.addProvider(new NonceSubProvider())
-      : this.engine.addProvider(singletonNonceSubProvider);
-
-    this.engine.addProvider(new FiltersSubprovider());
-    if (typeof providerToUse === "string") {
-      const url = providerToUse;
-
-      const providerProtocol = (
-        Url.parse(url).protocol || "http:"
-      ).toLowerCase();
-
-      switch (providerProtocol) {
-        case "ws:":
-        case "wss:":
-          this.engine.addProvider(new WebsocketProvider({ rpcUrl: url }));
-          break;
-        default:
-          this.engine.addProvider(new RpcProvider({ rpcUrl: url }));
-      }
-    } else {
-      this.engine.addProvider(new ProviderSubprovider(providerToUse));
-    }
-
-    // Required by the provider engine.
-    this.engine.start();
   }
 
   private initialize(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.engine.sendAsync(
+      console.log("INITIALIZE", { provider: this.#provider });
+      this.#provider.sendAsync(
         {
           jsonrpc: "2.0",
           id: Date.now(),
           method: "eth_chainId",
           params: []
         },
-        // @ts-ignore - the type doesn't take into account the possibility
-        // that response.error could be a thing
-        (error: any, response: JSONRPCResponsePayload & { error?: any }) => {
+        (error: any, response: JsonRpcResponse<string>) => {
+          console.log("INITIALIZE.HANDLE", { error, response });
           if (error) {
             reject(error);
             return;
-          } else if (response.error) {
+          } else if ("error" in response) {
             reject(response.error);
             return;
           }
-          if (isNaN(parseInt(response.result, 16))) {
+          if ("result" in response && isNaN(parseInt(response.result, 16))) {
             const message =
               "When requesting the chain id from the node, it" +
               `returned the malformed result ${response.result}.`;
@@ -362,21 +453,32 @@ class HDWalletProvider {
   }
 
   public send(
-    payload: JSONRPCRequestPayload,
-    // @ts-ignore we patch this method so it doesn't conform to type
-    callback: (error: null | Error, response: JSONRPCResponsePayload) => void
+    payload: JsonRpcRequest,
+    callback: (
+      error: null | Error,
+      response: JsonRpcResponse<JsonRpcParams>
+    ) => void
   ): void {
+    console.trace("SEND");
     this.initialized.then(() => {
-      this.engine.sendAsync(payload, callback);
+      console.log("SEND.INITIALIZED");
+      // @ts-ignore we patch callback method so it doesn't conform to type
+      this.#provider.sendAsync(payload, callback);
     });
   }
 
   public sendAsync(
-    payload: JSONRPCRequestPayload,
-    callback: (error: null | Error, response: JSONRPCResponsePayload) => void
+    payload: JsonRpcRequest,
+    callback: (
+      error: null | Error,
+      response?: JsonRpcResponse<JsonRpcParams>
+    ) => void
   ): void {
+    console.trace("HDP.SENDASYNC");
     this.initialized.then(() => {
-      this.engine.sendAsync(payload, callback);
+      console.log("HDP.SENDASYNC.INITIALIZED");
+      // @ts-ignore we patch callback method so it doesn't conform to type
+      this.#provider.sendAsync(payload, callback);
     });
   }
 
