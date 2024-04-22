@@ -34,7 +34,7 @@
     "ethereum-cryptography": "1.1.2",
     "ethereumjs-util": "^7.1.5",
     "nonce-tracker": "^2.0.0",
-    "web3-provider-engine": "^16.0.6"
+    "web3-provider-engine": "17.0.1"
   },
   "devDependencies": {
     "@types/bip39": "^2.4.2",
